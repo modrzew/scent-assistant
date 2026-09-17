@@ -18,6 +18,9 @@ SCENT_MARKETING_TYPES = {
     DeviceType.SCENT_MARKETING_GW,
     DeviceType.SCENT_MARKETING_GW_XOR,
 }
+# Device families whose BLE protocol exposes a child-lock-style toggle
+# (Scent Marketing's physical-button lock, Gizwits' BLE-password lock).
+LOCK_TYPES = SCENT_MARKETING_TYPES | {DeviceType.GIZWITS_BLE}
 
 
 async def async_setup_entry(
@@ -35,15 +38,18 @@ async def async_setup_entry(
         entities.append(DiffuserFanSwitch(device, entry))
 
     # Scent Marketing devices expose extra controls when running on BLE.
-    if device.device_type in SCENT_MARKETING_TYPES and not is_cloud:
+    if device.device_type in LOCK_TYPES and not is_cloud:
         entities.append(DiffuserLockSwitch(device, entry))
-        if device.device_type == DeviceType.SCENT_MARKETING_AK:
-            # The AK control bitmask carries a lamp bit we can drive
-            # without any extra protocol work. (The fan switch is already
-            # added above via `device.supports_fan`, which is True for AK —
-            # appending it here too would register a second entity with the
-            # same `_fan` unique_id and HA would reject the duplicate.)
+        if device.device_type in (DeviceType.SCENT_MARKETING_AK, DeviceType.GIZWITS_BLE):
+            # The AK control bitmask carries a lamp bit; Gizwits BLE has a
+            # dedicated ledPower attribute. Either way we can drive it
+            # without extra protocol work. (The fan switch is already
+            # added above via `device.supports_fan`, which is True for
+            # both — appending it here too would register a second entity
+            # with the same `_fan` unique_id and HA would reject the
+            # duplicate.)
             entities.append(DiffuserLampSwitch(device, entry))
+        if device.device_type == DeviceType.SCENT_MARKETING_AK:
             # V3 AK devices have a separate program-enabled toggle that
             # is distinct from Power. We register the entity for every
             # AK device but make it unavailable on V2 (where it would

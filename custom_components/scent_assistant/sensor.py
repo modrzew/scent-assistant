@@ -58,6 +58,14 @@ async def async_setup_entry(
     if device.device_type in SCENT_MARKETING_TYPES:
         entities.append(DiffuserDetectionDiagnostic(device, entry))
 
+    # Gizwits BLE (Scent Online app) — devBattery and oilQuantity are
+    # plain uint8 attributes in the schema, but we have no confirmed way
+    # to *request* them (see GIZWITS_PROTOCOL.md §6) so these stay
+    # unavailable unless the device pushes an unsolicited DEVICE_REPORT.
+    if device.device_type == DeviceType.GIZWITS_BLE:
+        entities.append(DiffuserBatterySensor(device, entry))
+        entities.append(DiffuserOilSensor(device, entry))
+
     # Scent Marketing AK V3 oil block (decoded by @Mins95, #18). Sensors
     # stay unavailable until the device answers C8/CE, so registering them
     # for the whole AK family is safe (V2 simply never populates them).

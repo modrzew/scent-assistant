@@ -1,4 +1,5 @@
 """Constants for the Scent Diffuser integration."""
+from dataclasses import dataclass
 from enum import StrEnum
 
 DOMAIN = "scent_assistant"
@@ -15,6 +16,7 @@ class DeviceType(StrEnum):
     SCENT_MARKETING_GW = "scent_marketing_gw"          # Scent Marketing app, GW family (EE01 service, framed DP protocol)
     SCENT_MARKETING_GW_XOR = "scent_marketing_gw_xor"  # Scent Marketing app, GW family with XOR-encrypted JSON payload
     AROMELY_ARO_MAX = "aromely_aro_max"                # Aromely Aro Max (FFE0 service, 55-framed register protocol)
+    GIZWITS_BLE = "gizwits_ble"                        # Scent Online app (Gizwits SDK) — Airscent.au Tower Stream 2 and similar
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +436,128 @@ CLOUD_POLL_INTERVAL_SECONDS = 60
 BLE_REFRESH_INTERVAL_SECONDS = 300
 
 # ---------------------------------------------------------------------------
+# Gizwits BLE protocol (Scent Online app — Airscent.au Tower Stream 2 and
+# similar). Reverse-engineered by decompiling the app + its bundled native
+# libNativeCommandParser.so; NOT verified against real hardware. See
+# GIZWITS_PROTOCOL.md at the repo root for the full writeup and confidence
+# markers on every constant below.
+# ---------------------------------------------------------------------------
+
+# V2 (legacy) — single combo read/write/notify characteristic.
+GIZWITS_V2_SERVICE_UUID = "0000abf0-0000-1000-8000-00805f9b34fb"
+GIZWITS_V2_CHAR_UUID = "0000abf7-0000-1000-8000-00805f9b34fb"
+
+# V5 (current) — split characteristics per direction.
+GIZWITS_V5_SERVICE_UUID = "0000abd0-0000-1000-8000-00805f9b34fb"
+GIZWITS_V5_CHAR_READ_UUID = "0000abd4-0000-1000-8000-00805f9b34fb"
+GIZWITS_V5_CHAR_WRITE_UUID = "0000abd5-0000-1000-8000-00805f9b34fb"
+GIZWITS_V5_CHAR_INDICATE_UUID = "0000abd6-0000-1000-8000-00805f9b34fb"
+GIZWITS_V5_CHAR_WRITE_NO_RESPONSE_UUID = "0000abd7-0000-1000-8000-00805f9b34fb"
+GIZWITS_V5_CHAR_NOTIFY_UUID = "0000abd8-0000-1000-8000-00805f9b34fb"
+
+# Manufacturer-data company ID the app's scanner checks for (GIZWITS_PROTOCOL.md
+# §5). Byte-order-inferred from the BT spec, not verified against a live
+# advertisement — treat detection via GIZWITS_V2_SERVICE_UUID /
+# GIZWITS_V5_SERVICE_UUID as the reliable signal and this as a bonus.
+GIZWITS_MFR_ID = 0x003D  # 61 decimal
+
+# V5 command bytes (DeviceCommandConstantV5 in the decompiled app).
+GIZ_CMD_DEVICE_REPORT = 1
+GIZ_CMD_APP_CTRL = 2
+GIZ_CMD_DEVICE_REPLY = 3
+GIZ_CMD_DEVICE_CTRL = 4
+GIZ_CMD_APP_REPLY = 5
+GIZ_CMD_APP_SEND_BLE_KEY = 8
+GIZ_CMD_DEVICE_REPLY_BLE_KEY = 9
+GIZ_CMD_APP_BIND = 10
+GIZ_CMD_DEVICE_REPLY_BIND = 11
+
+# Outer "BT data" envelope marker + flag (GizWifiSDKEncodeBTData). Every
+# call site in the app uses flag=1.
+GIZ_BT_MARKER = 0x72
+GIZ_BT_FLAG_WRITE = 1
+
+# The single entity name every bundled product config declares
+# (entities[0].name). DP writes/reads are tagged with this string, not a
+# numeric id.
+GIZ_ENTITY_NAME = "entity0"
+
+# Advertisement flags-byte bit positions (GIZWITS_PROTOCOL.md §5), read from
+# the 4th byte of the manufacturer-data payload (after the 2-byte marker).
+GIZ_ADV_FLAG_REQUIRES_AUTH_BIT = 4
+GIZ_ADV_FLAG_AUTH_METHOD_BIT = 5
+GIZ_ADV_FLAG_SUPPORT_OTA_BIT = 3
+
+
+@dataclass(frozen=True)
+class GizAttr:
+    """One data-point attribute in a Gizwits "var_len" product schema."""
+
+    id: int
+    name: str
+    data_type: str  # "bool" | "uint8" | "uint16" | "uint32" | "binary"
+    bit_len: int     # total bits on the wire (1 for bool, 8*N for binary)
+
+
+# The 45-attribute schema shared by the "香愿香熏机_BLE" and
+# "香愿香熏机_BLE_V1_1" product configs bundled in the Scent Online APK —
+# the two configs meant for Bluetooth-only hardware, and our best guess for
+# a single-cartridge unit like the Tower Stream 2. If the real device turns
+# out to be a multi-cartridge "tower" hub, it likely needs the 170-attribute
+# "香愿香薰机V5" schema instead (10 cartridge slots + sensors) — see
+# GIZWITS_PROTOCOL.md §7.
+#
+# `id` order is load-bearing: it's both the presence-bitmap bit index and
+# the attribute-packing order on the wire.
+GIZWITS_BLE_SCHEMA: tuple[GizAttr, ...] = (
+    GizAttr(0, "devLifting", "bool", 1),
+    GizAttr(1, "recoverySet", "bool", 1),
+    GizAttr(2, "onOff", "bool", 1),
+    GizAttr(3, "fanOnOff", "bool", 1),
+    GizAttr(4, "lcd_Switch", "bool", 1),
+    GizAttr(5, "ledPower", "bool", 1),
+    GizAttr(6, "ledFollowPump", "bool", 1),
+    GizAttr(7, "devEnergyStatus", "uint8", 8),
+    GizAttr(8, "devBattery", "uint8", 8),
+    GizAttr(9, "devMode", "uint8", 8),
+    GizAttr(10, "oilQuantity", "uint8", 8),
+    GizAttr(11, "group_manage_datapoint", "uint8", 8),
+    GizAttr(12, "oilDepthMode", "uint8", 8),
+    GizAttr(13, "CurPLGears", "uint8", 8),
+    GizAttr(14, "blePasswordEnable", "uint8", 8),
+    GizAttr(15, "sharePasswordEnable", "uint8", 8),
+    GizAttr(16, "oilResetting", "uint8", 8),
+    GizAttr(17, "ledBrightness", "uint8", 8),
+    GizAttr(18, "ledMode", "uint8", 8),
+    GizAttr(19, "ledSpeed", "uint8", 8),
+    GizAttr(20, "TermOfValidity_mon", "uint8", 8),
+    GizAttr(21, "oilType", "uint16", 16),
+    GizAttr(22, "devType", "uint16", 16),
+    GizAttr(23, "OilCapacity", "uint16", 16),
+    GizAttr(24, "TermOfValidity_year", "uint16", 16),
+    GizAttr(25, "devTime", "binary", 8 * 8),
+    GizAttr(26, "devRunStatus", "binary", 14 * 8),
+    GizAttr(27, "blePassword", "binary", 8 * 8),
+    GizAttr(28, "sharePassword", "binary", 8 * 8),
+    GizAttr(29, "PL_SetTime1", "binary", 8 * 8),
+    GizAttr(30, "PL_SetTime2", "binary", 8 * 8),
+    GizAttr(31, "PL_SetTime3", "binary", 8 * 8),
+    GizAttr(32, "PL_SetTime4", "binary", 8 * 8),
+    GizAttr(33, "PL_SetTime5", "binary", 8 * 8),
+    GizAttr(34, "PL_SetTime6", "binary", 8 * 8),
+    GizAttr(35, "PL_SetTime7", "binary", 8 * 8),
+    GizAttr(36, "PE_SetTime1", "binary", 11 * 8),
+    GizAttr(37, "PE_SetTime2", "binary", 11 * 8),
+    GizAttr(38, "PE_SetTime3", "binary", 11 * 8),
+    GizAttr(39, "PE_SetTime4", "binary", 11 * 8),
+    GizAttr(40, "PE_SetTime5", "binary", 11 * 8),
+    GizAttr(41, "PE_SetTime6", "binary", 11 * 8),
+    GizAttr(42, "PE_SetTime7", "binary", 11 * 8),
+    GizAttr(43, "ledRGB", "binary", 3 * 8),
+    GizAttr(44, "OilName", "binary", 50 * 8),
+)
+
+# ---------------------------------------------------------------------------
 # Weekday bitmask (shared by both protocols)
 # ---------------------------------------------------------------------------
 
@@ -462,6 +586,11 @@ CONF_CONNECTION_MODE = "connection_mode"
 # firmware sometimes ships locked; setting this lets the device accept
 # our control commands).
 CONF_GW_PASSWORD = "gw_password"
+# Detection metadata captured at scan time for Gizwits BLE devices (GATT
+# generation, login requirement/method, shot-product-key) — persisted so
+# device.py doesn't need a live advertisement to reconnect. See
+# protocol_ble.extract_gizwits_metadata().
+CONF_GIZ_METADATA = "giz_metadata"
 
 # ---------------------------------------------------------------------------
 # Defaults

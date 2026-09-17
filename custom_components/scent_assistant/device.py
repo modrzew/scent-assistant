@@ -34,6 +34,7 @@ from .protocol_ble import (
     ScentMarketingGwProtocol,
     ScentMarketingGwXorProtocol,
     AromelyAroMaxProtocol,
+    GizwitsBleProtocol,
     get_protocol,
     detect_device_type,
 )
@@ -69,6 +70,7 @@ class ScentDiffuserDevice:
         cloud_device_id: str | None = None,
         sm_metadata: dict | None = None,
         gw_password: str | None = None,
+        giz_metadata: dict | None = None,
     ) -> None:
         # HomeAssistant reference, used to fetch a cached BLEDevice via
         # the core bluetooth integration before opening a connection.
@@ -77,6 +79,10 @@ class ScentDiffuserDevice:
         # Detection metadata from the config flow — populated only for
         # Scent Marketing family devices.
         self._sm_metadata = sm_metadata or {}
+        # Detection metadata for Gizwits BLE devices (is_v2, requires_auth,
+        # auth_is_one_key — see protocol_ble.extract_gizwits_metadata).
+        # Persisted so a reconnect doesn't need a fresh advertisement.
+        self._giz_metadata = giz_metadata or {}
         # Optional 4-char ASCII password for Scent Marketing GW devices.
         # Sent proactively after every BLE connect.
         self._gw_password = gw_password or None
@@ -118,7 +124,9 @@ class ScentDiffuserDevice:
         # devices with PID 98 use the Tuya-DP hex parser.
         mac = (ble_address or "").replace(":", "")
         pid = self._sm_metadata.get("pid") if self._sm_metadata else None
-        self._protocol: BleProtocol = get_protocol(self._device_type, mac=mac, pid=pid)
+        self._protocol: BleProtocol = get_protocol(
+            self._device_type, mac=mac, pid=pid, giz_metadata=self._giz_metadata,
+        )
 
         # Cloud
         self._cloud: AromaLinkCloudClient | None = cloud_client
@@ -160,6 +168,11 @@ class ScentDiffuserDevice:
     def sm_metadata(self) -> dict:
         """Scent Marketing detection metadata (empty for other families)."""
         return self._sm_metadata
+
+    @property
+    def giz_metadata(self) -> dict:
+        """Gizwits BLE detection metadata (empty for other families)."""
+        return self._giz_metadata
 
     @property
     def recent_notifications(self) -> list[str]:
@@ -205,6 +218,7 @@ class ScentDiffuserDevice:
             DeviceType.SCENT_MARKETING_GW: "Scent Marketing (GW)",
             DeviceType.SCENT_MARKETING_GW_XOR: "Scent Marketing (GW, encrypted)",
             DeviceType.AROMELY_ARO_MAX: "Aromely Aro Max",
+            DeviceType.GIZWITS_BLE: "Gizwits BLE (Scent Online) — untested",
         }
         base = mapping.get(self._device_type, self._device_type.value)
         # Append the PID when known — different OEMs share the same family
@@ -451,6 +465,46 @@ class ScentDiffuserDevice:
                         await self._teardown_ble_client()
                         self._ble_last_failure_ts = loop.time()
                         return False
+
+                # Gizwits BLE — login handshake (cmd 8/9) precedes any DP
+                # write when the advertisement's flags said one is needed.
+                # Untested: if we can't derive the bleKey (no product
+                # secret — see GIZWITS_PROTOCOL.md §4) we log once and try
+                # writes anyway, since a wrong assumption about
+                # requires_auth would otherwise make the device look
+                # completely uncontrollable instead of just failing loud.
+                if isinstance(self._protocol, GizwitsBleProtocol):
+                    self._protocol.reset_login_state()
+                    if self._protocol.needs_login():
+                        login_frame = self._protocol.build_login(self._ble_address or "")
+                        if login_frame is None:
+                            _LOGGER.warning(
+                                "Gizwits BLE device %s appears to require a "
+                                "login we can't derive (missing product "
+                                "secret — see GIZWITS_PROTOCOL.md §4). "
+                                "Trying writes without logging in; the "
+                                "device may silently ignore them.",
+                                self._ble_name,
+                            )
+                        else:
+                            try:
+                                await self._ble_send(login_frame)
+                                await asyncio.sleep(0.3)
+                                if not self._protocol.login_completed:
+                                    _LOGGER.warning(
+                                        "Gizwits BLE login to %s got no "
+                                        "reply — device may reject "
+                                        "subsequent writes",
+                                        self._ble_name,
+                                    )
+                            except (BleakError, asyncio.TimeoutError, OSError) as err:
+                                _LOGGER.warning(
+                                    "Gizwits BLE login failed on %s: %s",
+                                    self._ble_name, err,
+                                )
+                                await self._teardown_ble_client()
+                                self._ble_last_failure_ts = loop.time()
+                                return False
 
                 # Time sync on first connection of this session (skipped for
                 # protocols that don't support it).
@@ -841,11 +895,14 @@ class ScentDiffuserDevice:
             )
 
     async def set_fan(self, on: bool) -> bool:
-        """Turn fan on or off (Aroma-Link + Scent Marketing AK)."""
+        """Turn fan on or off (Aroma-Link + Scent Marketing AK + Gizwits BLE)."""
         if not self._ble_address:
             return False
         proto = self._protocol
-        if isinstance(proto, (AromaLinkBleProtocol, ScentMarketingAkProtocol, AromelyAroMaxProtocol)):
+        if isinstance(proto, (
+            AromaLinkBleProtocol, ScentMarketingAkProtocol,
+            AromelyAroMaxProtocol, GizwitsBleProtocol,
+        )):
             cmd = proto.build_fan(on)
             if await self._ble_execute(cmd):
                 self._state.fan = on
@@ -854,11 +911,11 @@ class ScentDiffuserDevice:
         return False
 
     async def set_lock(self, on: bool) -> bool:
-        """Toggle child-lock (Scent Marketing AK + GW + GW-XOR)."""
+        """Toggle child-lock (Scent Marketing AK + GW + GW-XOR + Gizwits BLE password lock)."""
         if not self._ble_address:
             return False
         proto = self._protocol
-        if isinstance(proto, (ScentMarketingAkProtocol, ScentMarketingGwProtocol)):
+        if isinstance(proto, (ScentMarketingAkProtocol, ScentMarketingGwProtocol, GizwitsBleProtocol)):
             cmd = proto.build_lock(on)
             if await self._ble_execute(cmd):
                 self._state.lock = on
@@ -867,7 +924,7 @@ class ScentDiffuserDevice:
         return False
 
     async def set_lamp(self, on: bool) -> bool:
-        """Toggle auxiliary lamp (Scent Marketing AK lamp-bit, GW DP-11 light)."""
+        """Toggle auxiliary lamp (Scent Marketing AK lamp-bit, GW DP-11 light, Gizwits BLE LED)."""
         if not self._ble_address:
             return False
         proto = self._protocol
@@ -875,6 +932,8 @@ class ScentDiffuserDevice:
             cmd = proto.build_lamp(on)
         elif isinstance(proto, ScentMarketingGwProtocol):
             cmd = proto.build_light(on)
+        elif isinstance(proto, GizwitsBleProtocol):
+            cmd = proto.build_lamp(on)
         else:
             return False
         if await self._ble_execute(cmd):
@@ -919,15 +978,30 @@ class ScentDiffuserDevice:
         return True
 
     async def set_intensity(self, intensity: int) -> bool:
-        """Set Scent Marketing AK spray intensity.
+        """Set spray intensity (Scent Marketing AK or Gizwits BLE).
 
-        The AK protocol bundles intensity into schedule frames (no
+        Gizwits BLE has a standalone `CurPLGears` attribute — a plain DP
+        write, no schedule bundling needed (unconfirmed range; the schema
+        only says uint8, so this clamps to 0-255 rather than guessing a
+        tighter real-world ceiling).
+
+        The AK protocol bundles intensity into schedule frames instead (no
         dedicated opcode is known), so this stores the value locally and
         the next schedule write will pick it up. The Number entity also
         triggers a schedule re-write so the change takes effect
         immediately even when the user doesn't separately touch a Start
         Time / End Time entity.
         """
+        if isinstance(self._protocol, GizwitsBleProtocol):
+            if not self._ble_address:
+                return False
+            cmd = self._protocol.build_intensity(intensity)
+            if await self._ble_execute(cmd):
+                self._state.intensity = max(0, min(255, int(intensity)))
+                self._notify_state_changed()
+                return True
+            return False
+
         if not isinstance(self._protocol, ScentMarketingAkProtocol):
             return False
         # Clamp to the firmware-accepted range. V2 caps at 10, V3 at 20.

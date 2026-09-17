@@ -27,6 +27,13 @@ async def async_setup_entry(
         async_add_entities([ScentimentLevelNumber(device, entry)])
         return
 
+    if device.device_type == DeviceType.GIZWITS_BLE:
+        # No confirmed schedule write (GIZWITS_PROTOCOL.md §7) — skip
+        # Work/Pause Duration rather than expose entities that silently
+        # no-op. Intensity (CurPLGears) is a standalone, confirmed DP.
+        async_add_entities([GizwitsIntensityNumber(device, entry)])
+        return
+
     entities: list[NumberEntity] = [
         WorkDurationNumber(device, entry),
         PauseDurationNumber(device, entry),
@@ -167,6 +174,48 @@ class ScentMarketingIntensityNumber(NumberEntity):
     _attr_icon = "mdi:speedometer"
     _attr_native_min_value = 0
     _attr_native_max_value = 20
+    _attr_native_step = 1
+    _attr_mode = NumberMode.SLIDER
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
+        self._device = device
+        self._attr_unique_id = f"{device.unique_id}_intensity"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, device.unique_id)},
+        }
+        device.register_state_callback(self._on_state_update)
+
+    def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        return self._device.state.intensity
+
+    @property
+    def available(self) -> bool:
+        return self._device.available
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self._device.set_intensity(int(value))
+
+
+class GizwitsIntensityNumber(NumberEntity):
+    """Spray intensity for Gizwits BLE devices (`CurPLGears`, attr 13).
+
+    Range is the schema's uint8 ceiling (0-255), not a confirmed
+    real-world value — GIZWITS_PROTOCOL.md §7 flags this attribute's
+    actual usable range as unknown. A standalone DP write, unlike Scent
+    Marketing AK where intensity is bundled into schedule frames.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Intensity"
+    _attr_icon = "mdi:speedometer"
+    _attr_native_min_value = 0
+    _attr_native_max_value = 255
     _attr_native_step = 1
     _attr_mode = NumberMode.SLIDER
 

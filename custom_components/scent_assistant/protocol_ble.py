@@ -67,12 +67,26 @@ from .const import (
     AL_FAN_ON_VALUE, AL_FAN_OFF_VALUE,
     AL_SLOT_ENABLED, AL_SLOT_DISABLED,
     AL_PHASE_IDLE, AL_PHASE_SPRAYING, AL_PHASE_PAUSED,
+    GizAttr,
+    GIZWITS_V2_SERVICE_UUID, GIZWITS_V2_CHAR_UUID,
+    GIZWITS_V5_SERVICE_UUID, GIZWITS_V5_CHAR_READ_UUID,
+    GIZWITS_V5_CHAR_WRITE_UUID, GIZWITS_V5_CHAR_INDICATE_UUID,
+    GIZWITS_V5_CHAR_WRITE_NO_RESPONSE_UUID, GIZWITS_V5_CHAR_NOTIFY_UUID,
+    GIZWITS_MFR_ID,
+    GIZ_CMD_DEVICE_REPORT, GIZ_CMD_APP_CTRL, GIZ_CMD_DEVICE_REPLY,
+    GIZ_CMD_DEVICE_CTRL, GIZ_CMD_APP_REPLY,
+    GIZ_CMD_APP_SEND_BLE_KEY, GIZ_CMD_DEVICE_REPLY_BLE_KEY,
+    GIZ_BT_MARKER, GIZ_BT_FLAG_WRITE, GIZ_ENTITY_NAME,
+    GIZ_ADV_FLAG_REQUIRES_AUTH_BIT, GIZ_ADV_FLAG_AUTH_METHOD_BIT,
+    GIZ_ADV_FLAG_SUPPORT_OTA_BIT,
+    GIZWITS_BLE_SCHEMA,
 )
 
+import hashlib
 import json
 import random
 import time
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from bleak.backends.scanner import AdvertisementData
@@ -2139,6 +2153,459 @@ class ScentMarketingGwXorProtocol(ScentMarketingGwProtocol):
 
 
 # ---------------------------------------------------------------------------
+# Gizwits BLE (Scent Online app — Airscent.au Tower Stream 2 and similar)
+#
+# Reverse-engineered by decompiling the app + its bundled native
+# libNativeCommandParser.so with Ghidra headless. NOT verified against real
+# hardware — see GIZWITS_PROTOCOL.md at the repo root for the full writeup,
+# confidence markers, and what's still unconfirmed (schedule/RGB internal
+# byte layout, the exact login `productSecret`, V2's opcode set).
+# ---------------------------------------------------------------------------
+
+def _gizwits_encode_entity(
+    schema: tuple[GizAttr, ...], values: dict[str, Any]
+) -> bytes:
+    """Pack a subset of attribute values into a Gizwits "var_len" value blob.
+
+    Mirrors the native `FUN_0001d250` struct packer: a presence bitmap (one
+    bit per schema attribute id, LSB-first, `total_attr_count` bits wide)
+    followed by the values themselves in ascending id order — bit-packed
+    for `bool` (contiguous, LSB-first, across byte boundaries), byte-aligned
+    for everything else. Unknown attribute names are silently ignored.
+    """
+    by_name = {a.name: a for a in schema}
+    present = sorted(
+        (by_name[name] for name in values if name in by_name),
+        key=lambda a: a.id,
+    )
+    if not present:
+        return b""
+
+    bitmap_len = (len(schema) + 7) // 8
+    bitmap = bytearray(bitmap_len)
+    for attr in present:
+        bitmap[attr.id >> 3] |= 1 << (attr.id & 7)
+
+    bitfield_bits = sum(a.bit_len for a in present if a.data_type == "bool")
+    bitfield_bytes = (bitfield_bits + 7) // 8
+    value_region = bytearray(
+        bitfield_bytes + sum(a.bit_len // 8 for a in present if a.data_type != "bool")
+    )
+
+    bit_pos = 0
+    byte_pos = bitfield_bytes
+    for attr in present:
+        value = values[attr.name]
+        if attr.data_type == "bool":
+            if value:
+                idx = bit_pos
+                value_region[idx >> 3] |= 1 << (idx & 7)
+            bit_pos += attr.bit_len
+        elif attr.data_type == "uint8":
+            value_region[byte_pos] = int(value) & 0xFF
+            byte_pos += 1
+        elif attr.data_type == "uint16":
+            v = int(value) & 0xFFFF
+            value_region[byte_pos:byte_pos + 2] = v.to_bytes(2, "big")
+            byte_pos += 2
+        elif attr.data_type == "uint32":
+            v = int(value) & 0xFFFFFFFF
+            value_region[byte_pos:byte_pos + 4] = v.to_bytes(4, "big")
+            byte_pos += 4
+        elif attr.data_type == "binary":
+            n_bytes = attr.bit_len // 8
+            raw = bytes(value)[:n_bytes]
+            value_region[byte_pos:byte_pos + len(raw)] = raw
+            byte_pos += n_bytes
+
+    return bytes(bitmap) + bytes(value_region)
+
+
+def _gizwits_decode_entity(
+    schema: tuple[GizAttr, ...], blob: bytes
+) -> dict[str, Any]:
+    """Inverse of `_gizwits_encode_entity` — best-effort, unconfirmed.
+
+    We've never observed a real `value` blob coming back from a device, so
+    this mirrors the encoder's layout assumption (same presence bitmap +
+    packing order) without independent confirmation. Returns {} if the
+    blob is too short for even the presence bitmap.
+    """
+    bitmap_len = (len(schema) + 7) // 8
+    if len(blob) < bitmap_len:
+        return {}
+    bitmap = blob[:bitmap_len]
+    present = [a for a in schema if bitmap[a.id >> 3] & (1 << (a.id & 7))]
+
+    bitfield_bits = sum(a.bit_len for a in present if a.data_type == "bool")
+    bitfield_bytes = (bitfield_bits + 7) // 8
+    region = blob[bitmap_len:]
+
+    result: dict[str, Any] = {}
+    bit_pos = 0
+    byte_pos = bitfield_bytes
+    for attr in present:
+        try:
+            if attr.data_type == "bool":
+                idx = bit_pos
+                result[attr.name] = bool(region[idx >> 3] & (1 << (idx & 7)))
+                bit_pos += attr.bit_len
+            elif attr.data_type == "uint8":
+                result[attr.name] = region[byte_pos]
+                byte_pos += 1
+            elif attr.data_type == "uint16":
+                result[attr.name] = int.from_bytes(region[byte_pos:byte_pos + 2], "big")
+                byte_pos += 2
+            elif attr.data_type == "uint32":
+                result[attr.name] = int.from_bytes(region[byte_pos:byte_pos + 4], "big")
+                byte_pos += 4
+            elif attr.data_type == "binary":
+                n_bytes = attr.bit_len // 8
+                result[attr.name] = bytes(region[byte_pos:byte_pos + n_bytes])
+                byte_pos += n_bytes
+        except IndexError:
+            break
+    return result
+
+
+class GizwitsBleProtocol(BleProtocol):
+    """Gizwits BLE (V2 legacy / V5 current) — Scent Online app.
+
+    Untested against real hardware. `is_v2` picks the GATT layout and
+    switches the (currently V5-only) framing/login logic off — see
+    GIZWITS_PROTOCOL.md §3 for why V2's opcode set needs its own RE pass
+    before this class can drive one.
+    """
+
+    device_type = DeviceType.GIZWITS_BLE
+    schema: tuple[GizAttr, ...] = GIZWITS_BLE_SCHEMA
+
+    def __init__(
+        self,
+        is_v2: bool = False,
+        requires_auth: bool | None = None,
+        auth_is_one_key: bool = False,
+        product_key: str = "",
+        product_secret: str | None = None,
+    ) -> None:
+        self.is_v2 = is_v2
+        # None = unknown (no advertisement flags parsed) — treated as
+        # "assume required" so we don't silently skip a login the device
+        # actually needs.
+        self.requires_auth = requires_auth
+        self.auth_is_one_key = auth_is_one_key
+        self.product_key = product_key
+        self.product_secret = product_secret
+        self._login_complete = False
+        self._sn = 0
+        self._rx_frames: dict[int, BasePackParserV5Buffer] = {}
+
+    # ------------------------------------------------------------------
+    # GATT layout — instance-level since it depends on detected version.
+    # ------------------------------------------------------------------
+
+    @property
+    def service_uuid(self) -> str:  # type: ignore[override]
+        return GIZWITS_V2_SERVICE_UUID if self.is_v2 else GIZWITS_V5_SERVICE_UUID
+
+    @property
+    def write_char_uuid(self) -> str:  # type: ignore[override]
+        return GIZWITS_V2_CHAR_UUID if self.is_v2 else GIZWITS_V5_CHAR_WRITE_UUID
+
+    @property
+    def notify_char_uuid(self) -> str:  # type: ignore[override]
+        return GIZWITS_V2_CHAR_UUID if self.is_v2 else GIZWITS_V5_CHAR_NOTIFY_UUID
+
+    # ------------------------------------------------------------------
+    # Login handshake (V5 only — see class docstring)
+    # ------------------------------------------------------------------
+
+    @property
+    def login_completed(self) -> bool:
+        return self._login_complete
+
+    def reset_login_state(self) -> None:
+        """Called by the device manager before each fresh BLE connect."""
+        self._login_complete = False
+        self._sn = 0
+        self._rx_frames.clear()
+
+    def needs_login(self) -> bool:
+        """Whether a login handshake should run before any DP write.
+
+        `requires_auth is None` (advertisement flags weren't parsed, or
+        the device is V2) defaults to True — safer to attempt a login
+        that turns out unnecessary than to skip one the device silently
+        drops all subsequent writes for.
+        """
+        if self.is_v2:
+            return False  # V2 opcode set not reverse-engineered yet.
+        return self.requires_auth is not False
+
+    def can_derive_ble_key(self) -> bool:
+        """Whether we have every input needed for the offline key formula.
+
+        False for `ONE_KEY` mode (needs a cloud round-trip we don't
+        implement) or when `product_secret` wasn't supplied — see
+        GIZWITS_PROTOCOL.md §4.
+        """
+        return bool(
+            not self.auth_is_one_key and self.product_key and self.product_secret
+        )
+
+    def build_login(self, mac: str) -> bytes | None:
+        """Build the cmd=8 login command, or None if we can't derive a key.
+
+        `ble_key = sha256(f"{product_key}+{mac_lower}+{secret_lower}")[:32]`
+        — the `ONE_PRODUCT_KEY` offline formula (GIZWITS_PROTOCOL.md §4).
+
+        Returns the same `[cmd] + payload` shape as `build_power` etc. —
+        pass it through `wire_chunks` (not straight to the GATT layer) to
+        get the actual on-wire V5 frame.
+        """
+        if not self.can_derive_ble_key():
+            return None
+        mac_norm = mac.lower().replace(":", "")
+        digest = hashlib.sha256(
+            f"{self.product_key}+{mac_norm}+{self.product_secret.lower()}".encode()
+        ).hexdigest()
+        ble_key = bytes.fromhex(digest[:32])
+        return bytes([GIZ_CMD_APP_SEND_BLE_KEY]) + ble_key
+
+    # ------------------------------------------------------------------
+    # V5 framing — sn/ver(1) + cmd(1) + seq/frames(1) + len(1) + payload
+    # ------------------------------------------------------------------
+
+    def _next_sn(self) -> int:
+        self._sn = (self._sn + 1) & 0x1F
+        return self._sn
+
+    def wire_chunks(self, frame: bytes) -> list[bytes]:
+        """Split a (cmd, payload) pair into MTU-sized V5 chunks.
+
+        `frame` here is the *payload only* (produced by `build_power` /
+        `build_query` etc. below) prefixed with a 1-byte cmd marker we
+        strip back off — see those builders. Chunk size follows the SDK's
+        `packOsBMiQA`: `mtu - 4` payload bytes per chunk, `seq` from 0,
+        `frames` = total chunk count - 1, both packed into byte 2.
+        """
+        if not frame:
+            return [frame]
+        cmd = frame[0]
+        payload = frame[1:]
+        mtu = 20
+        chunk_size = max(1, mtu - 4)
+        chunks_payload = [
+            payload[i:i + chunk_size] for i in range(0, len(payload), chunk_size)
+        ] or [b""]
+        frames = len(chunks_payload) - 1
+        sn = self._next_sn()
+        out = []
+        for seq, chunk in enumerate(chunks_payload):
+            header = bytes([
+                sn & 0x1F,
+                cmd & 0x7F,
+                (seq & 0x0F) | ((frames & 0x0F) << 4),
+                len(chunk) & 0xFF,
+            ])
+            out.append(header + chunk)
+        return out
+
+    # ------------------------------------------------------------------
+    # Commands
+    # ------------------------------------------------------------------
+    #
+    # `wire_chunks` (above) expects a leading 1-byte cmd marker followed
+    # by the raw entity payload — that marker is stripped and used as the
+    # V5 frame `cmd` field, then discarded, so `build_*` below just needs
+    # to produce `bytes([cmd]) + entity_payload`.
+
+    def _build_ctrl(self, values: dict[str, Any]) -> bytes:
+        entity_value = _gizwits_encode_entity(self.schema, values)
+        name = GIZ_ENTITY_NAME.encode("ascii")
+        tagged = bytes([len(name)]) + name + len(entity_value).to_bytes(2, "big") + entity_value
+        bt_data = bytes([GIZ_BT_MARKER]) + GIZ_BT_FLAG_WRITE.to_bytes(2, "big") + tagged
+        return bytes([GIZ_CMD_APP_CTRL]) + bt_data
+
+    def build_power(self, on: bool) -> bytes:
+        return self._build_ctrl({"onOff": bool(on)})
+
+    def build_fan(self, on: bool) -> bytes:
+        return self._build_ctrl({"fanOnOff": bool(on)})
+
+    def build_lamp(self, on: bool) -> bytes:
+        return self._build_ctrl({"ledPower": bool(on)})
+
+    def build_lock(self, on: bool) -> bytes:
+        return self._build_ctrl({"blePasswordEnable": bool(on)})
+
+    def build_lift(self, on: bool) -> bytes:
+        return self._build_ctrl({"devLifting": bool(on)})
+
+    def build_intensity(self, level: int) -> bytes:
+        return self._build_ctrl({"CurPLGears": max(0, min(255, int(level)))})
+
+    def build_query(self) -> bytes:
+        """No confirmed read-request encoding exists (GIZWITS_PROTOCOL.md
+        §6) — the native `GizWifiSDKEncodeGetStatus` path was never
+        decompiled. Devices may push full state unsolicited after
+        connect + login (`DEVICE_REPORT`, cmd=1) without an explicit
+        request; until that's confirmed this is a no-op.
+        """
+        return b""
+
+    def build_time_sync(self, now: datetime | None = None) -> bytes | None:
+        """`devTime` (attr 25, 8 raw bytes) is writable, but its internal
+        byte layout was never observed being encoded anywhere in the app —
+        GIZWITS_PROTOCOL.md §7. Returning None until that's confirmed
+        rather than guess a layout and silently corrupt the device's
+        clock.
+        """
+        return None
+
+    def supports_fan(self) -> bool:
+        return True
+
+    # ------------------------------------------------------------------
+    # Notification parsing / reassembly
+    # ------------------------------------------------------------------
+
+    def _feed(self, data: bytes) -> tuple[int, bytes] | None:
+        """Reassemble V5 chunks by (cmd, frames), mirroring
+        `BasePackParserV5.push`. Returns (cmd, full_payload) once the last
+        chunk (seq == frames) has arrived, else None.
+        """
+        if len(data) < 4:
+            return None
+        sn = data[0] & 0x1F
+        cmd = data[1] & 0x7F
+        seq = data[2] & 0x0F
+        frames = (data[2] & 0xF0) >> 4
+        length = data[3]
+        payload = data[4:4 + length]
+
+        buf = self._rx_frames.get(sn)
+        if seq == 0 or buf is None or buf.cmd != cmd:
+            buf = BasePackParserV5Buffer(cmd=cmd, frames=frames)
+            self._rx_frames[sn] = buf
+        buf.payload += payload
+        if seq >= frames:
+            del self._rx_frames[sn]
+            return (cmd, buf.payload)
+        return None
+
+    def parse_notification(self, data: bytes) -> dict:
+        result: dict = {}
+        reassembled = self._feed(bytes(data))
+        if reassembled is None:
+            return result
+        cmd, payload = reassembled
+
+        if cmd == GIZ_CMD_DEVICE_REPLY_BLE_KEY:
+            self._login_complete = bool(payload) and payload[0] == 0x00
+            return result
+
+        if cmd not in (GIZ_CMD_DEVICE_REPORT, GIZ_CMD_DEVICE_REPLY, GIZ_CMD_DEVICE_CTRL):
+            return result
+
+        # Unconfirmed: assumes DEVICE_REPORT reuses the same
+        # marker/tag/entity-value layout as our writes. GIZWITS_PROTOCOL.md
+        # §6 flags this as needing a live capture to verify — the
+        # decompiled decoder branches on marker bytes (0x06/0x55/0x16)
+        # that don't obviously match 0x72.
+        if len(payload) < 3 or payload[0] != GIZ_BT_MARKER:
+            return result
+        pos = 3
+        if pos >= len(payload):
+            return result
+        name_len = payload[pos]
+        pos += 1
+        name = payload[pos:pos + name_len].decode("ascii", errors="replace")
+        pos += name_len
+        if name != GIZ_ENTITY_NAME or pos + 2 > len(payload):
+            return result
+        value_len = int.from_bytes(payload[pos:pos + 2], "big")
+        pos += 2
+        value_blob = payload[pos:pos + value_len]
+
+        attrs = _gizwits_decode_entity(self.schema, value_blob)
+        if "onOff" in attrs:
+            result["power"] = attrs["onOff"]
+            result["phase"] = "idle" if attrs["onOff"] else "off"
+        if "fanOnOff" in attrs:
+            result["fan"] = attrs["fanOnOff"]
+        if "ledPower" in attrs:
+            result["light_on"] = attrs["ledPower"]
+        if "blePasswordEnable" in attrs:
+            result["lock"] = attrs["blePasswordEnable"]
+        if "devBattery" in attrs:
+            result["battery"] = max(0, min(100, attrs["devBattery"]))
+        if "oilQuantity" in attrs:
+            result["oil_remaining"] = max(0, min(100, attrs["oilQuantity"]))
+        if "CurPLGears" in attrs:
+            result["intensity"] = attrs["CurPLGears"]
+        return result
+
+
+@dataclass
+class BasePackParserV5Buffer:
+    """Reassembly state for one in-flight multi-chunk V5 notification."""
+
+    cmd: int
+    frames: int
+    payload: bytes = b""
+
+
+def _detect_gizwits(advertisement_data) -> tuple[DeviceType, bool] | None:
+    """Match a Gizwits BLE advertisement by service UUID.
+
+    Returns (DeviceType.GIZWITS_BLE, is_v2) or None. Service UUID is the
+    reliable signal (GIZWITS_PROTOCOL.md §5) — manufacturer-data flag
+    parsing for auth requirements happens separately in
+    `extract_gizwits_metadata`, since a device can be identified without
+    ever resolving those flags.
+    """
+    if advertisement_data is None:
+        return None
+    uuids = {str(u).lower() for u in (getattr(advertisement_data, "service_uuids", None) or [])}
+    if GIZWITS_V5_SERVICE_UUID in uuids or any(u.startswith("0000abd0") for u in uuids):
+        return (DeviceType.GIZWITS_BLE, False)
+    if GIZWITS_V2_SERVICE_UUID in uuids or any(u.startswith("0000abf0") for u in uuids):
+        return (DeviceType.GIZWITS_BLE, True)
+    return None
+
+
+def extract_gizwits_metadata(advertisement_data) -> dict:
+    """Parse the Gizwits manufacturer-data flags byte, if present.
+
+    Best-effort — GIZWITS_PROTOCOL.md §5 flags the byte-order of the
+    company-ID marker as inferred, not verified. Returns a dict with
+    `requires_auth`/`auth_is_one_key`/`shot_product_key`/`mac_from_adv`,
+    all None when the expected marker isn't found.
+    """
+    out: dict = {
+        "is_v2": False,
+        "requires_auth": None, "auth_is_one_key": False,
+        "shot_product_key": None, "mac_from_adv": None,
+    }
+    detected = _detect_gizwits(advertisement_data)
+    if detected is not None:
+        out["is_v2"] = detected[1]
+    if advertisement_data is None:
+        return out
+    mfr_data = getattr(advertisement_data, "manufacturer_data", None) or {}
+    payload = mfr_data.get(GIZWITS_MFR_ID)
+    if not payload or len(payload) < 12:
+        return out
+    flags = payload[1]
+    out["requires_auth"] = bool(flags & (1 << GIZ_ADV_FLAG_REQUIRES_AUTH_BIT))
+    out["auth_is_one_key"] = bool(flags & (1 << GIZ_ADV_FLAG_AUTH_METHOD_BIT))
+    out["shot_product_key"] = payload[2:6].hex()
+    out["mac_from_adv"] = payload[6:12].hex()
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -2146,11 +2613,15 @@ def get_protocol(
     device_type: DeviceType,
     mac: str = "",
     pid: int | None = None,
+    giz_metadata: dict | None = None,
 ) -> BleProtocol:
     """Get the appropriate protocol handler for a device type.
 
     For Scent Marketing GW devices a PID of 98 selects the Tuya-DP hex
-    parser instead of the regular binary one.
+    parser instead of the regular binary one. `giz_metadata` carries the
+    Gizwits detection dict from `extract_gizwits_metadata` (is_v2,
+    requires_auth, auth_is_one_key) — see device.py for how it's persisted
+    across reconnects.
     """
     tuya = (pid == 98)
     if device_type == DeviceType.TUYA_BLE:
@@ -2167,6 +2638,15 @@ def get_protocol(
         return ScentMarketingGwXorProtocol(mac=mac, tuya_dp_mode=tuya)
     elif device_type == DeviceType.AROMELY_ARO_MAX:
         return AromelyAroMaxProtocol()
+    elif device_type == DeviceType.GIZWITS_BLE:
+        meta = giz_metadata or {}
+        return GizwitsBleProtocol(
+            is_v2=meta.get("is_v2", False),
+            requires_auth=meta.get("requires_auth"),
+            auth_is_one_key=meta.get("auth_is_one_key", False),
+            product_key=meta.get("product_key", "") or "",
+            product_secret=meta.get("product_secret"),
+        )
     raise ValueError(f"Unknown device type: {device_type}")
 
 
@@ -2250,7 +2730,9 @@ def detect_device_type(
          reliable — the Android app uses this exclusively).
       2. Advertised service / manufacturer data for Aromely Aro Max
          (its local name is a per-unit serial).
-      3. BLE local-name prefix patterns for the other families.
+      3. Advertised service UUID for Gizwits BLE (Scent Online app) — its
+         local name is also a per-unit value, not a fixed prefix.
+      4. BLE local-name prefix patterns for the other families.
     """
     sm_type = _detect_scent_marketing(advertisement_data)
     if sm_type is not None:
@@ -2258,6 +2740,10 @@ def detect_device_type(
 
     if _detect_aromely(advertisement_data):
         return DeviceType.AROMELY_ARO_MAX
+
+    giz = _detect_gizwits(advertisement_data)
+    if giz is not None:
+        return giz[0]
 
     if not ble_name:
         return None

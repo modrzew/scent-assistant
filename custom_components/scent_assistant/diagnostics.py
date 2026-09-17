@@ -98,6 +98,10 @@ async def async_get_config_entry_diagnostics(
             dict(device.sm_metadata) if device and device.sm_metadata else {},
             TO_REDACT,
         ),
+        "giz_metadata": async_redact_data(
+            dict(device.giz_metadata) if device and device.giz_metadata else {},
+            TO_REDACT,
+        ),
         "state": state_snapshot,
         "recent_notifications_hex": device.recent_notifications if device else [],
         "recent_commands_hex": device.recent_commands if device else [],

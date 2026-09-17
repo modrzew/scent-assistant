@@ -53,6 +53,12 @@
 | Home Luxury Scents HLS-450+ | Home Luxury Scents | BLE | Rebadged Scent Marketing AK family |
 | Aromely Aro Max | Aromely | BLE | Power, Fan, daily schedule (work/pause), HVAC scent diffuser |
 
+### Experimental — Needs Testing
+
+| Device | App | Connection | Notes |
+|--------|-----|------------|-------|
+| Airscent.au Tower Stream 2 and similar | Scent Online | BLE | Gizwits SDK protocol; reverse-engineered from the app, **not yet verified against real hardware**. Power, Fan, LED, Child-lock, Intensity implemented; schedule not yet supported. See [GIZWITS_PROTOCOL.md](GIZWITS_PROTOCOL.md) for the full writeup and what's still unconfirmed. |
+
 ### Likely Compatible
 
 Most waterless cold-air nebulizing scent/aroma diffusers that use the **Aroma-Link** or **Aroma Buddy** apps should work. These are sold under various brand names on Amazon and AliExpress.
@@ -165,6 +171,20 @@ The set of entities depends on which device family is connected.
 | Oil remaining | Sensor | Fragrance level percentage (V3 models with an oil sensor) |
 | Oil remaining (ml) / Oil capacity | Sensor | Current and total fragrance volume (V3) |
 | Oil consumption / Oil days remaining | Sensor | Usage rate and estimated days left (V3; days computed in Custom mode) |
+
+### Gizwits BLE (Scent Online app) — experimental
+
+| Entity | Type | Description |
+|--------|------|-------------|
+| Fan | Switch | Fan on/off |
+| Lamp | Switch | LED on/off |
+| Child Lock | Switch | BLE-password lock |
+| Intensity | Number | Spray intensity/gear (0–255, unconfirmed real range) |
+| Battery / Oil remaining | Sensor | Only populate if the device pushes unsolicited state — no confirmed read-request yet |
+
+Schedule (Start/End Time, Work/Pause Duration) isn't exposed yet — the
+on-wire byte layout of the device's schedule attributes wasn't reverse-
+engineered. See [GIZWITS_PROTOCOL.md](GIZWITS_PROTOCOL.md).
 
 ---
 
@@ -303,6 +323,7 @@ This integration was built by reverse engineering the BLE protocols of both devi
 | Tuya BLE (Aroma Buddy) | `55 AA ...` | Sum mod 256 | Power, scheduling (5 setups), time sync |
 | Scent Marketing AK | `8F` login (PIN 8888) + `2A`/`4A` schedule | None (length-framed) | Power, Fan, Program, schedule read-back; V2 + V3 variants |
 | Aromely Aro Max | `55 <dir> <reg> <type> [len payload]` on FFE0/FFE1/FFE2 | Sum mod 256 | Power, fan, daily schedule (work/pause as u16 seconds) |
+| Gizwits BLE (Scent Online) — **untested** | `0x72` BT marker + name-tagged entity + bit-packed DPs | None (length-framed) | Power, Fan, LED, lock, intensity. See [GIZWITS_PROTOCOL.md](GIZWITS_PROTOCOL.md) |
 
 ---
 

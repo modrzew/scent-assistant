@@ -24,6 +24,11 @@ async def async_setup_entry(
     device: ScentDiffuserDevice = hass.data[DOMAIN][entry.entry_id]
     if device.device_type == DeviceType.SCENTIMENT:
         return
+    if device.device_type == DeviceType.GIZWITS_BLE:
+        # No confirmed schedule write yet (GIZWITS_PROTOCOL.md §7) —
+        # skip rather than expose Start/End Time entities that silently
+        # no-op on write.
+        return
 
     async_add_entities([
         DiffuserStartTime(device, entry),

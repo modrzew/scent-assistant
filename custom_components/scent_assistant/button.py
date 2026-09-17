@@ -24,7 +24,13 @@ async def async_setup_entry(
     if device.device_type == DeviceType.SCENTIMENT:
         return
 
-    entities: list[ButtonEntity] = [TimeSyncButton(device, entry)]
+    entities: list[ButtonEntity] = []
+    if device.device_type != DeviceType.GIZWITS_BLE:
+        # `devTime`'s internal byte layout is unconfirmed
+        # (GIZWITS_PROTOCOL.md §7) — build_time_sync() returns None for
+        # this protocol, so the button would silently "succeed" without
+        # syncing anything. Skip it until that's reverse-engineered.
+        entities.append(TimeSyncButton(device, entry))
     # Momentary diffusion is power-on + delayed power-off, which only
     # makes sense on families where power is a plain on/off (Aroma-Link).
     if device.device_type == DeviceType.AROMA_LINK:

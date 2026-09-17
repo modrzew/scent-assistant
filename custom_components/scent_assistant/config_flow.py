@@ -19,10 +19,15 @@ from .const import (
     CONF_CLOUD_USER_ID,
     CONF_CONNECTION_MODE,
     CONF_GW_PASSWORD,
+    CONF_GIZ_METADATA,
     DEFAULT_SCAN_TIMEOUT,
     DeviceType,
 )
-from .protocol_ble import detect_device_type, extract_scent_marketing_metadata
+from .protocol_ble import (
+    detect_device_type,
+    extract_scent_marketing_metadata,
+    extract_gizwits_metadata,
+)
 from .protocol_cloud import AromaLinkCloudClient
 
 _LOGGER = logging.getLogger(__name__)
@@ -42,6 +47,7 @@ class ScentDiffuserConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._selected_device_type: str | None = None
         self._selected_sm_metadata: dict | None = None
         self._selected_gw_password: str | None = None
+        self._selected_giz_metadata: dict | None = None
 
     def _create_ble_entry(self) -> config_entries.ConfigFlowResult:
         """Build the BLE-mode config entry. Shared by all BLE setup paths."""
@@ -55,6 +61,8 @@ class ScentDiffuserConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             entry_data["sm_metadata"] = self._selected_sm_metadata
         if self._selected_gw_password:
             entry_data[CONF_GW_PASSWORD] = self._selected_gw_password
+        if self._selected_giz_metadata:
+            entry_data[CONF_GIZ_METADATA] = self._selected_giz_metadata
         return self.async_create_entry(
             title=self._selected_ble_name or "Scent Diffuser",
             data=entry_data,
@@ -105,6 +113,7 @@ class ScentDiffuserConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self._selected_ble_name = device_info.get("name", "")
                 self._selected_device_type = device_info.get("device_type", "aroma_link")
                 self._selected_sm_metadata = device_info.get("sm_metadata")
+                self._selected_giz_metadata = device_info.get("giz_metadata")
 
                 # Check if already configured
                 await self.async_set_unique_id(address)
@@ -136,7 +145,9 @@ class ScentDiffuserConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 # so we accept it even when `name` is empty.
                 if not name and dtype is None:
                     continue
-                if not name:
+                if not name and dtype == DeviceType.GIZWITS_BLE:
+                    name = f"Gizwits BLE {device.address[-8:]}"
+                elif not name:
                     name = f"Scent Marketing {device.address[-8:]}"
 
                 sm_meta = extract_scent_marketing_metadata(adv_data) if dtype and dtype.value.startswith("scent_marketing") else None
@@ -148,12 +159,23 @@ class ScentDiffuserConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         sm_meta["raw_hex"],
                     )
 
+                giz_meta = extract_gizwits_metadata(adv_data) if dtype == DeviceType.GIZWITS_BLE else None
+                if giz_meta:
+                    _LOGGER.info(
+                        "Discovered Gizwits BLE device: addr=%s name=%s is_v2=%s "
+                        "requires_auth=%s auth_is_one_key=%s shot_product_key=%s",
+                        device.address, name, giz_meta["is_v2"],
+                        giz_meta["requires_auth"], giz_meta["auth_is_one_key"],
+                        giz_meta["shot_product_key"],
+                    )
+
                 self._discovered_devices[device.address] = {
                     "name": name,
                     "device_type": dtype or DeviceType.AROMA_LINK,
                     "rssi": adv_data.rssi,
                     "auto_detected": dtype is not None,
                     "sm_metadata": sm_meta,
+                    "giz_metadata": giz_meta,
                 }
         except Exception as err:
             _LOGGER.error("BLE scan failed: %s", err)
