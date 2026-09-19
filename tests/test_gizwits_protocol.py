@@ -317,6 +317,23 @@ class AdvertisementParsingTests(unittest.TestCase):
         self.assertTrue(protocol._detect_gizwits(adv))
         self.assertEqual(protocol.detect_device_type("", adv), const.DeviceType.GIZWITS_BLE)
 
+    def test_detects_via_name_prefix_when_service_uuid_not_surfaced(self):
+        # Regression (#41): HA's BlueZ-based passive scanner doesn't
+        # always surface service_uuids the way the doc's CoreBluetooth
+        # capture did, and detect_device_type() used to silently fall
+        # back to Aroma-Link (wrong FFF1/FFF2 characteristics) in that
+        # case. The XPG-GAgent-xxxx name prefix must catch it instead.
+        adv = advertisement(service_uuids=[])
+        self.assertFalse(protocol._detect_gizwits(adv))
+        self.assertEqual(
+            protocol.detect_device_type("XPG-GAgent-d97c", adv),
+            const.DeviceType.GIZWITS_BLE,
+        )
+        self.assertEqual(
+            protocol.detect_device_type("XPG-GAgent-d97c", None),
+            const.DeviceType.GIZWITS_BLE,
+        )
+
     def test_corebluetooth_concatenated_single_entry(self):
         raw = self.MAC_RECORD + self.KEY_RECORD
         company_id = int.from_bytes(raw[:2], "little")

@@ -316,6 +316,14 @@ BLE_NAME_PATTERNS = {
     # to the Aroma-Link default, whose FFF1-notify / FFF2-write layout
     # these devices do not have.
     DeviceType.SCENT_MARKETING_AK: ["SA_"],
+    # "XPG-GAgent" — Gizwits BLE V2 ("Scent Online" app). Detection is
+    # primarily by advertised ABF0 service UUID, but HA's BlueZ-based
+    # passive scanner doesn't reliably surface that list even when the
+    # device does advertise it (unlike the macOS/CoreBluetooth capture
+    # this protocol was verified against) — only the trailing 4 hex
+    # digits of the name are per-unit, so match the fixed prefix as a
+    # fallback rather than silently mis-detecting as Aroma-Link (#41).
+    DeviceType.GIZWITS_BLE: ["XPG-GAgent"],
 }
 
 # Scent Marketing devices are identified primarily by manufacturer-specific

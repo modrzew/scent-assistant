@@ -2801,8 +2801,9 @@ def detect_device_type(
          reliable — the Android app uses this exclusively).
       2. Advertised service / manufacturer data for Aromely Aro Max
          (its local name is a per-unit serial).
-      3. Advertised service UUID for Gizwits BLE (its local name,
-         `XPG-GAgent-xxxx`, is also per-unit, not a fixed prefix).
+      3. Advertised service UUID for Gizwits BLE, falling back to its
+         `XPG-GAgent` name prefix (step 4) when the stack doesn't
+         surface the service UUID list — see `BLE_NAME_PATTERNS`.
       4. BLE local-name prefix patterns for the other families.
     """
     sm_type = _detect_scent_marketing(advertisement_data)
