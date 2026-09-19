@@ -51,7 +51,9 @@
 | Scentiment Diffuser Air 2 | Scentiment | BLE | JSON-over-BLE protocol; intensity, RGB LED, battery |
 | Scent Marketing diffusers (SA_* series) | Scent Marketing | BLE | V2 + V3 variants; Power, Fan, Program switch, intensity, schedule read-back |
 | Home Luxury Scents HLS-450+ | Home Luxury Scents | BLE | Rebadged Scent Marketing AK family |
+| Gizwits-SDK "XPG-GAgent" diffusers | Scent Online | BLE | Gizwits BLE SDK V2, local-only, no cloud account needed |
 | Aromely Aro Max | Aromely | BLE | Power, Fan, daily schedule (work/pause), HVAC scent diffuser |
+| Gizwits "XPG-GAgent" diffusers | Scent Online | BLE | Power, Fan, Lift, Display, Intensity (gear), Energy/Concentration modes, schedule, oil %, battery |
 
 ### Likely Compatible
 
@@ -165,6 +167,24 @@ The set of entities depends on which device family is connected.
 | Oil remaining | Sensor | Fragrance level percentage (V3 models with an oil sensor) |
 | Oil remaining (ml) / Oil capacity | Sensor | Current and total fragrance volume (V3) |
 | Oil consumption / Oil days remaining | Sensor | Usage rate and estimated days left (V3; days computed in Custom mode) |
+
+### Gizwits BLE ("XPG-GAgent" diffusers)
+
+| Entity | Type | Description |
+|--------|------|-------------|
+| Fan | Switch | Fan on/off |
+| Lift | Switch | Cartridge platform lift |
+| Display | Switch | Display panel on/off |
+| Intensity | Number | Spray gear, 1-20 (PL "Gear" schedule mode) |
+| Schedule mode | Select | Gear (fixed intensity per slot) vs Timer (work/pause seconds per slot) |
+| Energy mode | Select | Sport / Comfort / Eco |
+| Concentration | Select | Low / Medium / High fragrance concentration |
+| Start Time / End Time | Time | Daily schedule window (slot 1) |
+| Work / Pause Duration | Number | Spray timing in Timer schedule mode |
+| Oil remaining | Sensor | Fragrance level percentage |
+| Battery | Sensor | Battery percentage |
+| Diffusion / Pause time remaining | Sensor | Live countdown of the current spray/pause phase |
+| Sync Time | Button | Manually sync the device clock |
 
 ---
 
@@ -303,6 +323,7 @@ This integration was built by reverse engineering the BLE protocols of both devi
 | Tuya BLE (Aroma Buddy) | `55 AA ...` | Sum mod 256 | Power, scheduling (5 setups), time sync |
 | Scent Marketing AK | `8F` login (PIN 8888) + `2A`/`4A` schedule | None (length-framed) | Power, Fan, Program, schedule read-back; V2 + V3 variants |
 | Aromely Aro Max | `55 <dir> <reg> <type> [len payload]` on FFE0/FFE1/FFE2 | Sum mod 256 | Power, fan, daily schedule (work/pause as u16 seconds) |
+| Gizwits BLE (Scent Online) | `00 00 00 03` + varint length, on ABF0/ABF7 | None (length-framed) | BIND/LOGIN handshake, Power, Fan, Lift, Display, Intensity, schedule, oil %, battery — see [GIZWITS_PROTOCOL.md](GIZWITS_PROTOCOL.md) |
 
 ---
 

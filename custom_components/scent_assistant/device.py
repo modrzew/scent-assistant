@@ -22,6 +22,8 @@ from .const import (
     DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_WORK_DURATION,
     DEFAULT_PAUSE_DURATION,
+    GIZ_MODE_PL,
+    GIZ_MODE_PE,
 )
 from .protocol_ble import (
     BleProtocol,
@@ -34,6 +36,7 @@ from .protocol_ble import (
     ScentMarketingGwProtocol,
     ScentMarketingGwXorProtocol,
     AromelyAroMaxProtocol,
+    GizwitsBleProtocol,
     get_protocol,
     detect_device_type,
 )
@@ -69,6 +72,7 @@ class ScentDiffuserDevice:
         cloud_device_id: str | None = None,
         sm_metadata: dict | None = None,
         gw_password: str | None = None,
+        giz_metadata: dict | None = None,
     ) -> None:
         # HomeAssistant reference, used to fetch a cached BLEDevice via
         # the core bluetooth integration before opening a connection.
@@ -80,6 +84,9 @@ class ScentDiffuserDevice:
         # Optional 4-char ASCII password for Scent Marketing GW devices.
         # Sent proactively after every BLE connect.
         self._gw_password = gw_password or None
+        # Detection metadata for Gizwits BLE devices (requires_auth,
+        # product_key — see protocol_ble.extract_gizwits_metadata).
+        self._giz_metadata = giz_metadata or {}
         # Trace ring-buffer for the diagnostics download.
         self._recent_notifications: list[str] = []
         self._recent_commands: list[str] = []
@@ -118,7 +125,9 @@ class ScentDiffuserDevice:
         # devices with PID 98 use the Tuya-DP hex parser.
         mac = (ble_address or "").replace(":", "")
         pid = self._sm_metadata.get("pid") if self._sm_metadata else None
-        self._protocol: BleProtocol = get_protocol(self._device_type, mac=mac, pid=pid)
+        self._protocol: BleProtocol = get_protocol(
+            self._device_type, mac=mac, pid=pid, giz_metadata=self._giz_metadata,
+        )
 
         # Cloud
         self._cloud: AromaLinkCloudClient | None = cloud_client
@@ -160,6 +169,11 @@ class ScentDiffuserDevice:
     def sm_metadata(self) -> dict:
         """Scent Marketing detection metadata (empty for other families)."""
         return self._sm_metadata
+
+    @property
+    def giz_metadata(self) -> dict:
+        """Gizwits BLE detection metadata (empty for other families)."""
+        return self._giz_metadata
 
     @property
     def recent_notifications(self) -> list[str]:
@@ -205,6 +219,7 @@ class ScentDiffuserDevice:
             DeviceType.SCENT_MARKETING_GW: "Scent Marketing (GW)",
             DeviceType.SCENT_MARKETING_GW_XOR: "Scent Marketing (GW, encrypted)",
             DeviceType.AROMELY_ARO_MAX: "Aromely Aro Max",
+            DeviceType.GIZWITS_BLE: "Gizwits BLE (Scent Online)",
         }
         base = mapping.get(self._device_type, self._device_type.value)
         # Append the PID when known — different OEMs share the same family
@@ -271,6 +286,25 @@ class ScentDiffuserDevice:
             except Exception:
                 _LOGGER.exception("Error in state callback")
 
+    async def _wait_until(
+        self, predicate: callable, timeout: float = 2.0, poll: float = 0.2,
+    ) -> bool:
+        """Poll `predicate()` every `poll` seconds until true or `timeout`
+        elapses. Returns whether it became true.
+
+        Used for the Gizwits BLE BIND/LOGIN handshake replies instead of a
+        single fixed sleep — a bare sleep works on a directly-attached
+        adapter but is too tight over a Bluetooth proxy (ESPHome etc.),
+        where the extra network hop adds real round-trip latency.
+        """
+        elapsed = 0.0
+        while elapsed < timeout:
+            if predicate():
+                return True
+            await asyncio.sleep(poll)
+            elapsed += poll
+        return predicate()
+
     # ------------------------------------------------------------------
     # BLE connect-on-demand
     # ------------------------------------------------------------------
@@ -333,22 +367,90 @@ class ScentDiffuserDevice:
                 self._ble_connected = True
 
                 # Subscribe to notifications for responses. Without these
-                # the AK family can't sync state back to HA, so a silent
+                # no protocol can sync state back to HA, so a silent
                 # failure here is worth surfacing — bump it from debug to
                 # warning so it shows up in logs and diagnostics. Track
                 # whether the subscription took, so the disconnect path
                 # can call stop_notify before tearing the link down.
-                try:
-                    await self._ble_client.start_notify(
-                        self._protocol.notify_char_uuid, self._on_ble_notification
-                    )
-                    self._ble_notify_subscribed = True
-                except Exception as err:
-                    self._ble_notify_subscribed = False
-                    _LOGGER.warning(
-                        "BLE start_notify failed on %s (%s): %s",
-                        self._ble_name, self._protocol.notify_char_uuid, err,
-                    )
+                #
+                # GATT error 133 (a generic "something went wrong" code on
+                # both Android and BlueZ) is commonly transient right after
+                # connecting — the link hasn't fully settled yet. A couple
+                # of short-delay retries clear it far more often than a
+                # bare first attempt (observed consistently on Gizwits BLE
+                # over an ESPHome proxy, GIZWITS_PROTOCOL.md §2).
+                self._ble_notify_subscribed = False
+                for attempt in range(3):
+                    try:
+                        await self._ble_client.start_notify(
+                            self._protocol.notify_char_uuid, self._on_ble_notification
+                        )
+                        self._ble_notify_subscribed = True
+                        break
+                    except Exception as err:
+                        if attempt == 2:
+                            _LOGGER.warning(
+                                "BLE start_notify failed on %s (%s) after "
+                                "%d attempts: %s",
+                                self._ble_name, self._protocol.notify_char_uuid,
+                                attempt + 1, err,
+                            )
+                        else:
+                            _LOGGER.debug(
+                                "BLE start_notify attempt %d failed on %s "
+                                "(%s), retrying: %s",
+                                attempt + 1, self._ble_name,
+                                self._protocol.notify_char_uuid, err,
+                            )
+                            await asyncio.sleep(0.5 * (attempt + 1))
+
+                # Gizwits BLE — BIND_DEVICE + LOGIN_DEVICE precedes any DP
+                # write when the advertisement's flags said one is needed
+                # (or weren't parsed at all, in which case we err toward
+                # attempting it). Login is mandatory and enforced: the
+                # device silently drops every DP write without a completed
+                # login, so a failed/timed-out handshake here aborts the
+                # connection rather than limping on with writes that would
+                # be silent no-ops (GIZWITS_PROTOCOL.md §4).
+                if isinstance(self._protocol, GizwitsBleProtocol):
+                    self._protocol.reset_login_state()
+                    if self._protocol.needs_login():
+                        try:
+                            await self._ble_send(self._protocol.build_bind())
+                            await self._wait_until(
+                                lambda: self._protocol.passcode_received
+                            )
+                            login_frame = self._protocol.build_login()
+                            if login_frame is None:
+                                _LOGGER.warning(
+                                    "Gizwits BLE BIND on %s got no passcode "
+                                    "back", self._ble_name,
+                                )
+                                await self._teardown_ble_client()
+                                self._ble_last_failure_ts = loop.time()
+                                return False
+                            await self._ble_send(login_frame)
+                            await self._wait_until(
+                                lambda: self._protocol.login_completed
+                            )
+                            if not self._protocol.login_completed:
+                                _LOGGER.warning(
+                                    "Gizwits BLE login to %s didn't confirm "
+                                    "success — device would silently drop "
+                                    "every subsequent write",
+                                    self._ble_name,
+                                )
+                                await self._teardown_ble_client()
+                                self._ble_last_failure_ts = loop.time()
+                                return False
+                        except (BleakError, asyncio.TimeoutError, OSError) as err:
+                            _LOGGER.warning(
+                                "Gizwits BLE login failed on %s: %s",
+                                self._ble_name, err,
+                            )
+                            await self._teardown_ble_client()
+                            self._ble_last_failure_ts = loop.time()
+                            return False
 
                 # Scent Marketing AK family — PIN 8888 login must precede
                 # every other write, otherwise the device drops them
@@ -715,6 +817,22 @@ class ScentDiffuserDevice:
         if "schedule_enabled" in updates:
             self._state.schedule_enabled = updates["schedule_enabled"]
             changed = True
+        # Gizwits BLE — new state fields
+        if "lift" in updates:
+            self._state.lift = updates["lift"]
+            changed = True
+        if "display" in updates:
+            self._state.display = updates["display"]
+            changed = True
+        if "energy_mode" in updates:
+            self._state.energy_mode = updates["energy_mode"]
+            changed = True
+        if "concentration" in updates:
+            self._state.concentration = updates["concentration"]
+            changed = True
+        if "spray_mode" in updates:
+            self._state.spray_mode = updates["spray_mode"]
+            changed = True
 
         # Derive oil days-remaining from the latest oil + schedule state.
         # The 0x50 frame's raw value doesn't match the official app, which
@@ -841,11 +959,14 @@ class ScentDiffuserDevice:
             )
 
     async def set_fan(self, on: bool) -> bool:
-        """Turn fan on or off (Aroma-Link + Scent Marketing AK)."""
+        """Turn fan on or off (Aroma-Link + Scent Marketing AK + Gizwits BLE)."""
         if not self._ble_address:
             return False
         proto = self._protocol
-        if isinstance(proto, (AromaLinkBleProtocol, ScentMarketingAkProtocol, AromelyAroMaxProtocol)):
+        if isinstance(proto, (
+            AromaLinkBleProtocol, ScentMarketingAkProtocol, AromelyAroMaxProtocol,
+            GizwitsBleProtocol,
+        )):
             cmd = proto.build_fan(on)
             if await self._ble_execute(cmd):
                 self._state.fan = on
@@ -879,6 +1000,66 @@ class ScentDiffuserDevice:
             return False
         if await self._ble_execute(cmd):
             self._state.light_on = on
+            self._notify_state_changed()
+            return True
+        return False
+
+    async def set_lift(self, on: bool) -> bool:
+        """Toggle the cartridge platform lift (Gizwits BLE `devLifting`)."""
+        if not isinstance(self._protocol, GizwitsBleProtocol) or not self._ble_address:
+            return False
+        cmd = self._protocol.build_lift(on)
+        if await self._ble_execute(cmd):
+            self._state.lift = on
+            self._notify_state_changed()
+            return True
+        return False
+
+    async def set_display(self, on: bool) -> bool:
+        """Toggle the display panel (Gizwits BLE `lcd_Switch`)."""
+        if not isinstance(self._protocol, GizwitsBleProtocol) or not self._ble_address:
+            return False
+        cmd = self._protocol.build_display(on)
+        if await self._ble_execute(cmd):
+            self._state.display = on
+            self._notify_state_changed()
+            return True
+        return False
+
+    async def set_energy_mode(self, mode: int) -> bool:
+        """Set sport/comfort/eco mode (Gizwits BLE `devEnergyStatus`, 0-2)."""
+        if not isinstance(self._protocol, GizwitsBleProtocol) or not self._ble_address:
+            return False
+        clamped = max(0, min(2, int(mode)))
+        cmd = self._protocol.build_energy_mode(clamped)
+        if await self._ble_execute(cmd):
+            self._state.energy_mode = clamped
+            self._notify_state_changed()
+            return True
+        return False
+
+    async def set_concentration(self, mode: int) -> bool:
+        """Set fragrance concentration (Gizwits BLE `oilDepthMode`, 1-3)."""
+        if not isinstance(self._protocol, GizwitsBleProtocol) or not self._ble_address:
+            return False
+        clamped = max(1, min(3, int(mode)))
+        cmd = self._protocol.build_concentration(clamped)
+        if await self._ble_execute(cmd):
+            self._state.concentration = clamped
+            self._notify_state_changed()
+            return True
+        return False
+
+    async def set_spray_mode(self, mode: int) -> bool:
+        """Explicitly select the Gizwits BLE schedule engine (PL "Gear" vs
+        PE "Timer"). Standalone `devMode` write — the currently active
+        schedule slot isn't touched.
+        """
+        if not isinstance(self._protocol, GizwitsBleProtocol) or not self._ble_address:
+            return False
+        cmd = self._protocol.build_schedule_mode(mode)
+        if await self._ble_execute(cmd):
+            self._state.spray_mode = mode
             self._notify_state_changed()
             return True
         return False
@@ -919,15 +1100,25 @@ class ScentDiffuserDevice:
         return True
 
     async def set_intensity(self, intensity: int) -> bool:
-        """Set Scent Marketing AK spray intensity.
+        """Set spray intensity (Scent Marketing AK or Gizwits BLE).
 
-        The AK protocol bundles intensity into schedule frames (no
-        dedicated opcode is known), so this stores the value locally and
-        the next schedule write will pick it up. The Number entity also
-        triggers a schedule re-write so the change takes effect
-        immediately even when the user doesn't separately touch a Start
-        Time / End Time entity.
+        Gizwits BLE has a standalone `CurPLGears` attribute — a plain DP
+        write, unlike AK where intensity is bundled into schedule frames.
         """
+        if isinstance(self._protocol, GizwitsBleProtocol):
+            if not self._ble_address:
+                return False
+            clamped = max(1, min(20, int(intensity)))
+            cmd = self._protocol.build_intensity(clamped)
+            if await self._ble_execute(cmd):
+                self._state.intensity = clamped
+                # build_intensity also switches the device to PL (gear)
+                # mode in the same write — see its docstring.
+                self._state.spray_mode = GIZ_MODE_PL
+                self._notify_state_changed()
+                return True
+            return False
+
         if not isinstance(self._protocol, ScentMarketingAkProtocol):
             return False
         # Clamp to the firmware-accepted range. V2 caps at 10, V3 at 20.
@@ -989,13 +1180,14 @@ class ScentDiffuserDevice:
     async def set_work_duration(self, seconds: int) -> bool:
         """Set the spray work duration and write to device."""
         self._state.work_seconds = seconds
-        # Setting an explicit duration means the user wants Custom mode.
-        return await self._write_schedule_to_device(custom_mode=True)
+        # Setting an explicit duration means the user wants Custom mode
+        # (AK) / the PE "timer" schedule engine (Gizwits BLE).
+        return await self._write_schedule_to_device(custom_mode=True, giz_mode=GIZ_MODE_PE)
 
     async def set_pause_duration(self, seconds: int) -> bool:
         """Set the pause duration and write to device."""
         self._state.pause_seconds = seconds
-        return await self._write_schedule_to_device(custom_mode=True)
+        return await self._write_schedule_to_device(custom_mode=True, giz_mode=GIZ_MODE_PE)
 
     async def set_schedule(
         self,
@@ -1026,6 +1218,7 @@ class ScentDiffuserDevice:
         weekday_mask: int | None = None,
         enabled: bool = True,
         custom_mode: bool | None = None,
+        giz_mode: int | None = None,
     ) -> bool:
         """Write the current schedule state to the device.
 
@@ -1038,6 +1231,11 @@ class ScentDiffuserDevice:
         `custom_mode=None` preserves the device's current V3 schedule mode
         (Custom vs Level); callers that change Work/Pause pass True, and
         `set_intensity` passes False. Ignored on non-AK / V2 devices.
+
+        `giz_mode=None` (Gizwits BLE only) preserves whichever schedule
+        engine (PL "gear" vs PE "timer") the device last reported;
+        `set_work_duration`/`set_pause_duration` pass `GIZ_MODE_PE`
+        explicitly since adjusting a duration only makes sense there.
         """
         if weekday_mask is None:
             weekday_mask = self._state.weekday_mask if self._state.weekday_mask is not None else 0x7F
@@ -1104,6 +1302,20 @@ class ScentDiffuserDevice:
                     enabled=enabled, work_seconds=work, pause_seconds=pause,
                 )
                 cmd = self._protocol.build_schedule(slot, weekday_mask=weekday_mask)
+            elif isinstance(self._protocol, GizwitsBleProtocol):
+                slot = ScheduleSlot(
+                    start_hour=s_h, start_minute=s_m, end_hour=e_h, end_minute=e_m,
+                    enabled=enabled, work_seconds=work, pause_seconds=pause,
+                )
+                resolved_giz_mode = (
+                    giz_mode if giz_mode is not None
+                    else (self._state.spray_mode or GIZ_MODE_PE)
+                )
+                cmd = self._protocol.build_schedule(
+                    slot, weekday_mask=weekday_mask, mode=resolved_giz_mode,
+                    gear=self._state.intensity or 1,
+                )
+                self._state.spray_mode = resolved_giz_mode
 
             if cmd and await self._ble_execute(cmd):
                 self._notify_state_changed()

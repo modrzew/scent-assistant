@@ -72,6 +72,12 @@ async def async_get_config_entry_diagnostics(
             "device_label": s.device_label,
             "model_code": s.model_code,
             "schedule_enabled": s.schedule_enabled,
+            # Gizwits BLE only
+            "lift": s.lift,
+            "display": s.display,
+            "energy_mode": s.energy_mode,
+            "concentration": s.concentration,
+            "spray_mode": s.spray_mode,
         }
 
     payload: dict[str, Any] = {
@@ -96,6 +102,10 @@ async def async_get_config_entry_diagnostics(
         },
         "sm_metadata": async_redact_data(
             dict(device.sm_metadata) if device and device.sm_metadata else {},
+            TO_REDACT,
+        ),
+        "giz_metadata": async_redact_data(
+            dict(device.giz_metadata) if device and device.giz_metadata else {},
             TO_REDACT,
         ),
         "state": state_snapshot,

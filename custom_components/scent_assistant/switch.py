@@ -51,6 +51,10 @@ async def async_setup_entry(
             # which only resolves after the first BLE login.
             entities.append(DiffuserScheduleSwitch(device, entry))
 
+    if device.device_type == DeviceType.GIZWITS_BLE and not is_cloud:
+        entities.append(DiffuserLiftSwitch(device, entry))
+        entities.append(DiffuserDisplaySwitch(device, entry))
+
     async_add_entities(entities)
 
 
@@ -234,3 +238,69 @@ class DiffuserFanSwitch(SwitchEntity):
 
     async def async_turn_off(self, **kwargs) -> None:
         await self._device.set_fan(False)
+
+
+class DiffuserLiftSwitch(SwitchEntity):
+    """Cartridge platform lift (Gizwits BLE `devLifting`)."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Lift"
+    _attr_icon = "mdi:arrow-up-down"
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
+        self._device = device
+        self._attr_unique_id = f"{device.unique_id}_lift"
+        self._attr_device_info = device.device_info
+        device.register_state_callback(self._on_state_update)
+
+    def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
+        self.async_write_ha_state()
+
+    @property
+    def is_on(self) -> bool | None:
+        return self._device.state.lift
+
+    @property
+    def available(self) -> bool:
+        return self._device.available
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self._device.set_lift(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self._device.set_lift(False)
+
+
+class DiffuserDisplaySwitch(SwitchEntity):
+    """Display panel switch (Gizwits BLE `lcd_Switch`)."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Display"
+    _attr_icon = "mdi:monitor"
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
+        self._device = device
+        self._attr_unique_id = f"{device.unique_id}_display"
+        self._attr_device_info = device.device_info
+        device.register_state_callback(self._on_state_update)
+
+    def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
+        self.async_write_ha_state()
+
+    @property
+    def is_on(self) -> bool | None:
+        return self._device.state.display
+
+    @property
+    def available(self) -> bool:
+        return self._device.available
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self._device.set_display(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self._device.set_display(False)

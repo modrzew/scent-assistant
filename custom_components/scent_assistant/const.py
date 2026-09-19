@@ -1,4 +1,5 @@
 """Constants for the Scent Diffuser integration."""
+from dataclasses import dataclass
 from enum import StrEnum
 
 DOMAIN = "scent_assistant"
@@ -15,6 +16,7 @@ class DeviceType(StrEnum):
     SCENT_MARKETING_GW = "scent_marketing_gw"          # Scent Marketing app, GW family (EE01 service, framed DP protocol)
     SCENT_MARKETING_GW_XOR = "scent_marketing_gw_xor"  # Scent Marketing app, GW family with XOR-encrypted JSON payload
     AROMELY_ARO_MAX = "aromely_aro_max"                # Aromely Aro Max (FFE0 service, 55-framed register protocol)
+    GIZWITS_BLE = "gizwits_ble"                        # Scent Online app (Gizwits SDK V2, "XPG-GAgent" diffusers)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +193,104 @@ SM_GW_WRITE_UUID = "0000ee03-0000-1000-8000-00805f9b34fb"
 SM_GW_ALT_SERVICE_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
 SM_GW_ALT_NOTIFY_UUID = "0000ff02-0000-1000-8000-00805f9b34fb"
 SM_GW_ALT_WRITE_UUID = "0000ff03-0000-1000-8000-00805f9b34fb"
+
+# ---------------------------------------------------------------------------
+# Gizwits BLE V2 (Scent Online app — "XPG-GAgent" diffusers)
+# ---------------------------------------------------------------------------
+# Verified against real hardware (XPG-GAgent-d97c) on 2026-09-19 — see
+# GIZWITS_PROTOCOL.md at the repo root for the full writeup and captured
+# test vectors. This is the classic Gizwits "LAN protocol" reused over a
+# single BLE characteristic; only the V2 transport is implemented (V5 is
+# unverified and explicitly out of scope, per the protocol doc §10).
+
+GIZWITS_SERVICE_UUID = "0000abf0-0000-1000-8000-00805f9b34fb"
+GIZWITS_CHAR_UUID = "0000abf7-0000-1000-8000-00805f9b34fb"
+# Byte-order variants the official app also scans for (GIZWITS_PROTOCOL.md
+# §1.2) — same physical protocol, just a different UUID rendering by some
+# BLE stacks. Detection-only; the GATT layer always uses the pair above.
+GIZWITS_SERVICE_UUID_ALIASES = (
+    "0000abf8-0000-1000-8000-00805f9b34fb",
+    "0000f8ab-0000-1000-8000-00805f9b34fb",
+    "0000f0ab-0000-1000-8000-00805f9b34fb",
+)
+
+# Frame: 00 00 00 03 | varint LEN | flag(=0) | cmd (u16 BE) | body.
+GIZ_FRAME_HEADER = 0x00000003
+
+# V2 command bytes (GIZWITS_PROTOCOL.md §3.1).
+GIZ_CMD_BIND = 0x0006             # app -> dev, empty body
+GIZ_CMD_BIND_REPLY = 0x0007       # dev -> app, [u16 BE len][ASCII passcode]
+GIZ_CMD_LOGIN = 0x0008            # app -> dev, [u16 BE len][passcode]
+GIZ_CMD_LOGIN_REPLY = 0x0009      # dev -> app, [u8 result] (0x00 = success)
+GIZ_CMD_DATA_POINT = 0x0093       # app -> dev, [u32 BE sn][P0]
+GIZ_CMD_DATA_POINT_REPLY = 0x0094 # dev -> app, [u32 BE sn][P0] (empty P0 = write ack)
+GIZ_CMD_DATA_POINT_REPORT = 0x0091  # dev -> app, [P0] — NO sn field
+
+# P0 action markers for var_len products (GIZWITS_PROTOCOL.md §5).
+GIZ_DP_WRITE = 0x11
+GIZ_DP_READ = 0x12
+GIZ_DP_READ_REPLY = 0x13
+GIZ_DP_REPORT = 0x14
+
+# devMode values (attribute id 7) — selects which schedule engine is active.
+GIZ_MODE_PL = 1   # "gear" schedule: PL_SetTime1..7, fixed intensity per slot
+GIZ_MODE_PE = 2   # "timer" schedule: PE_SetTime1..7, work/pause seconds per slot
+
+
+@dataclass(frozen=True)
+class GizAttr:
+    """One data-point attribute in the Gizwits "var_len" product schema."""
+
+    id: int
+    name: str
+    data_type: str  # "bool" | "uint8" | "uint16" | "binary"
+    byte_len: int = 0  # only meaningful for "binary"
+
+
+# Product key c79041f7731b4a4f889d52c5ec9598c0 ("香愿香薰机_V2"), the only
+# schema implemented — GIZWITS_PROTOCOL.md §6. `id` order is load-bearing:
+# it is both the presence-bitmap bit index and the attribute-packing order
+# on the wire. Other product keys documented in the protocol doc's §10.1
+# use different, incompatible schemas and are not supported.
+GIZWITS_PRODUCT_KEY = "c79041f7731b4a4f889d52c5ec9598c0"
+
+GIZWITS_SCHEMA: tuple[GizAttr, ...] = (
+    GizAttr(0, "devLifting", "bool"),
+    GizAttr(1, "recoverySet", "bool"),
+    GizAttr(2, "onOff", "bool"),
+    GizAttr(3, "fanOnOff", "bool"),
+    GizAttr(4, "lcd_Switch", "bool"),
+    GizAttr(5, "devEnergyStatus", "uint8"),
+    GizAttr(6, "devBattery", "uint8"),
+    GizAttr(7, "devMode", "uint8"),
+    GizAttr(8, "oilQuantity", "uint8"),
+    GizAttr(9, "group_manage_datapoint", "uint8"),
+    GizAttr(10, "devType", "uint8"),
+    GizAttr(11, "oilDepthMode", "uint8"),
+    GizAttr(12, "CurPLGears", "uint8"),
+    GizAttr(13, "blePasswordEnable", "uint8"),
+    GizAttr(14, "sharePasswordEnable", "uint8"),
+    GizAttr(15, "oilResetting", "uint8"),
+    GizAttr(16, "oilType", "uint16"),
+    GizAttr(17, "devTime", "binary", 8),
+    GizAttr(18, "devRunStatus", "binary", 14),
+    GizAttr(19, "blePassword", "binary", 8),
+    GizAttr(20, "sharePassword", "binary", 8),
+    GizAttr(21, "PL_SetTime1", "binary", 8),
+    GizAttr(22, "PL_SetTime2", "binary", 8),
+    GizAttr(23, "PL_SetTime3", "binary", 8),
+    GizAttr(24, "PL_SetTime4", "binary", 8),
+    GizAttr(25, "PL_SetTime5", "binary", 8),
+    GizAttr(26, "PL_SetTime6", "binary", 8),
+    GizAttr(27, "PL_SetTime7", "binary", 8),
+    GizAttr(28, "PE_SetTime1", "binary", 11),
+    GizAttr(29, "PE_SetTime2", "binary", 11),
+    GizAttr(30, "PE_SetTime3", "binary", 11),
+    GizAttr(31, "PE_SetTime4", "binary", 11),
+    GizAttr(32, "PE_SetTime5", "binary", 11),
+    GizAttr(33, "PE_SetTime6", "binary", 11),
+    GizAttr(34, "PE_SetTime7", "binary", 11),
+)
 
 # ---------------------------------------------------------------------------
 # BLE name patterns for device detection
@@ -462,6 +562,10 @@ CONF_CONNECTION_MODE = "connection_mode"
 # firmware sometimes ships locked; setting this lets the device accept
 # our control commands).
 CONF_GW_PASSWORD = "gw_password"
+# Detection metadata captured at scan time for Gizwits BLE devices
+# (requires_auth, product_key) — persisted so a reconnect doesn't need a
+# fresh advertisement. See protocol_ble.extract_gizwits_metadata().
+CONF_GIZ_METADATA = "giz_metadata"
 
 # ---------------------------------------------------------------------------
 # Defaults

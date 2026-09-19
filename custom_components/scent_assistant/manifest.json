@@ -10,7 +10,11 @@
     { "manufacturer_id": 22851 },
     { "manufacturer_id": 17932 },
     { "manufacturer_id": 61441 },
-    { "service_uuid": "0000af30-0000-1000-8000-00805f9b34fb" }
+    { "service_uuid": "0000af30-0000-1000-8000-00805f9b34fb" },
+    { "service_uuid": "0000abf0-0000-1000-8000-00805f9b34fb" },
+    { "service_uuid": "0000abf8-0000-1000-8000-00805f9b34fb" },
+    { "service_uuid": "0000f8ab-0000-1000-8000-00805f9b34fb" },
+    { "service_uuid": "0000f0ab-0000-1000-8000-00805f9b34fb" }
   ],
   "codeowners": ["@mr-sparks"],
   "config_flow": true,

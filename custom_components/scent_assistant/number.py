@@ -33,6 +33,8 @@ async def async_setup_entry(
     ]
     if device.device_type == DeviceType.SCENT_MARKETING_AK:
         entities.append(ScentMarketingIntensityNumber(device, entry))
+    if device.device_type == DeviceType.GIZWITS_BLE:
+        entities.append(GizwitsIntensityNumber(device, entry))
     if device.device_type == DeviceType.AROMA_LINK:
         entities.append(MomentaryDurationNumber(device, entry))
     async_add_entities(entities)
@@ -166,6 +168,47 @@ class ScentMarketingIntensityNumber(NumberEntity):
     _attr_name = "Intensity"
     _attr_icon = "mdi:speedometer"
     _attr_native_min_value = 0
+    _attr_native_max_value = 20
+    _attr_native_step = 1
+    _attr_mode = NumberMode.SLIDER
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
+        self._device = device
+        self._attr_unique_id = f"{device.unique_id}_intensity"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, device.unique_id)},
+        }
+        device.register_state_callback(self._on_state_update)
+
+    def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        return self._device.state.intensity
+
+    @property
+    def available(self) -> bool:
+        return self._device.available
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self._device.set_intensity(int(value))
+
+
+class GizwitsIntensityNumber(NumberEntity):
+    """Spray intensity for Gizwits BLE devices (`CurPLGears`, gear 1-20).
+
+    A standalone DP write, unlike Scent Marketing AK where intensity is
+    bundled into schedule frames. Setting it also switches the device to
+    PL ("gear") schedule mode — see `ScentDiffuserDevice.set_intensity`.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Intensity"
+    _attr_icon = "mdi:speedometer"
+    _attr_native_min_value = 1
     _attr_native_max_value = 20
     _attr_native_step = 1
     _attr_mode = NumberMode.SLIDER
